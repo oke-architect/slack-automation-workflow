@@ -1,0 +1,255 @@
+name: Reusable Slack Push Notification
+
+on:
+  workflow_call:
+    secrets:
+      SLACK_BOT_TOKEN:
+        required: true
+
+jobs:
+  notify:
+    if: ${{ github.event.deleted != true }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Resolve Slack channel
+        id: slack-channel
+        shell: bash
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SLACK_BOT_TOKEN:-}" ]; then
+            echo "::error::SLACK_BOT_TOKEN is not configured."
+            exit 1
+          fi
+
+          #
+          # GitHub Repo 이름 -> Slack 채널명
+          #
+          # Example:
+          #   Architect.Harness
+          #        ↓
+          #   repo-architect-harness
+          #
+          repo_normalized=$(echo "$REPO_NAME" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9_-]/-/g' \
+            | sed 's/-\{2,\}/-/g' \
+            | sed 's/^-//' \
+            | sed 's/-$//')
+
+          CHANNEL_NAME="repo-${repo_normalized}"
+
+          # Slack channel 이름 최대 80자
+          CHANNEL_NAME="${CHANNEL_NAME:0:80}"
+          CHANNEL_NAME="${CHANNEL_NAME%-}"
+
+          echo "Target Slack channel: #${CHANNEL_NAME}"
+
+          #
+          # 기존 채널 검색
+          #
+          cursor=""
+          CHANNEL_ID=""
+          CHANNEL_ARCHIVED="false"
+
+          while true; do
+            args=(
+              --silent
+              --show-error
+              --get
+              "https://slack.com/api/conversations.list"
+              -H "Authorization: Bearer ${SLACK_BOT_TOKEN}"
+              --data-urlencode "types=public_channel"
+              --data-urlencode "limit=200"
+            )
+
+            if [ -n "$cursor" ]; then
+              args+=(--data-urlencode "cursor=${cursor}")
+            fi
+
+            response=$(curl "${args[@]}")
+
+            if [ "$(echo "$response" | jq -r '.ok')" != "true" ]; then
+              echo "::error::Slack conversations.list failed"
+              echo "$response"
+              exit 1
+            fi
+
+            CHANNEL_ID=$(echo "$response" \
+              | jq -r --arg name "$CHANNEL_NAME" \
+                '.channels[]? |
+                 select(.name == $name) |
+                 .id' \
+              | head -n 1)
+
+            if [ -n "$CHANNEL_ID" ]; then
+              CHANNEL_ARCHIVED=$(echo "$response" \
+                | jq -r --arg name "$CHANNEL_NAME" \
+                  '.channels[]? |
+                   select(.name == $name) |
+                   .is_archived' \
+                | head -n 1)
+
+              break
+            fi
+
+            cursor=$(echo "$response" \
+              | jq -r '.response_metadata.next_cursor // empty')
+
+            if [ -z "$cursor" ]; then
+              break
+            fi
+          done
+
+          #
+          # 기존 채널이 archived 상태라면 중지
+          #
+          if [ "$CHANNEL_ARCHIVED" = "true" ]; then
+            echo "::error::Slack channel #${CHANNEL_NAME} exists but is archived."
+            exit 1
+          fi
+
+          #
+          # 채널이 없으면 자동 생성
+          #
+          if [ -z "$CHANNEL_ID" ]; then
+            echo "Channel does not exist. Creating #${CHANNEL_NAME}..."
+
+            create_payload=$(jq -n \
+              --arg name "$CHANNEL_NAME" \
+              '{
+                name: $name,
+                is_private: false
+              }')
+
+            create_response=$(curl \
+              --silent \
+              --show-error \
+              -X POST \
+              "https://slack.com/api/conversations.create" \
+              -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+              -H "Content-Type: application/json; charset=utf-8" \
+              --data "$create_payload")
+
+            if [ "$(echo "$create_response" | jq -r '.ok')" != "true" ]; then
+              echo "::error::Slack conversations.create failed"
+              echo "$create_response"
+              exit 1
+            fi
+
+            CHANNEL_ID=$(echo "$create_response" | jq -r '.channel.id')
+
+            echo "Created Slack channel: #${CHANNEL_NAME}"
+          else
+            echo "Existing Slack channel found: #${CHANNEL_NAME}"
+          fi
+
+          echo "channel_id=${CHANNEL_ID}" >> "$GITHUB_OUTPUT"
+          echo "channel_name=${CHANNEL_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Build commit list
+        id: commits
+        shell: bash
+        env:
+          COMMITS_JSON: ${{ toJson(github.event.commits) }}
+          TOTAL_COMMITS: ${{ github.event.size }}
+        run: |
+          set -euo pipefail
+
+          DISPLAY_LIMIT=20
+
+          commit_list=$(echo "$COMMITS_JSON" |
+            jq -r --argjson limit "$DISPLAY_LIMIT" '
+              def escape_slack:
+                gsub("&"; "&amp;")
+                | gsub("<"; "&lt;")
+                | gsub(">"; "&gt;");
+
+              .[0:$limit][] |
+                "• <\(.url)|`\(.id[0:7])`> " +
+                ((.message | split("\n")[0]) | escape_slack) +
+                " — " +
+                ((.author.name // "unknown") | escape_slack)
+            ')
+
+          payload_count=$(echo "$COMMITS_JSON" | jq 'length')
+
+          if [ "$TOTAL_COMMITS" -gt "$DISPLAY_LIMIT" ]; then
+            remaining=$((TOTAL_COMMITS - DISPLAY_LIMIT))
+
+            commit_list="${commit_list}
+          … 외 ${remaining}개 Commit"
+          elif [ "$TOTAL_COMMITS" -gt "$payload_count" ]; then
+            remaining=$((TOTAL_COMMITS - payload_count))
+
+            commit_list="${commit_list}
+          … 외 ${remaining}개 Commit"
+          fi
+
+          {
+            echo 'list<<EOF'
+            echo "$commit_list"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Send Slack notification
+        shell: bash
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          CHANNEL_ID: ${{ steps.slack-channel.outputs.channel_id }}
+
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_URL: ${{ github.event.repository.html_url }}
+          BRANCH: ${{ github.ref_name }}
+          PUSHER: ${{ github.actor }}
+          COMMIT_COUNT: ${{ github.event.size }}
+          COMMIT_LIST: ${{ steps.commits.outputs.list }}
+          COMPARE_URL: ${{ github.event.compare }}
+        run: |
+          set -euo pipefail
+
+          TEXT=$(cat <<EOF
+          📦 *GitHub Push*
+
+          *Repository:* <${REPOSITORY_URL}|${REPOSITORY}>
+          *Branch:* \`${BRANCH}\`
+          *Pusher:* ${PUSHER}
+          *Commits:* ${COMMIT_COUNT}
+
+          *Commit details*
+          ${COMMIT_LIST}
+
+          <${COMPARE_URL}|전체 변경 내용 보기>
+          EOF
+          )
+
+          payload=$(jq -n \
+            --arg channel "$CHANNEL_ID" \
+            --arg text "$TEXT" \
+            '{
+              channel: $channel,
+              text: $text,
+              unfurl_links: false,
+              unfurl_media: false
+            }')
+
+          response=$(curl \
+            --silent \
+            --show-error \
+            -X POST \
+            "https://slack.com/api/chat.postMessage" \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-Type: application/json; charset=utf-8" \
+            --data "$payload")
+
+          if [ "$(echo "$response" | jq -r '.ok')" != "true" ]; then
+            echo "::error::Slack chat.postMessage failed"
+            echo "$response"
+            exit 1
+          fi
+
+          echo "Slack notification sent successfully."
