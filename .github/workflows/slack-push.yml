@@ -253,3 +253,101 @@ jobs:
           fi
 
           echo "Slack notification sent successfully."
+
+      - name: Add all workspace members to channel
+        shell: bash
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          CHANNEL_ID: ${{ steps.slack-channel.outputs.channel_id }}
+        run: |
+          set -euo pipefail
+
+          USER_IDS=()
+          cursor=""
+
+          while true; do
+            args=(
+              --silent
+              --show-error
+              --get
+              "https://slack.com/api/users.list"
+              -H "Authorization: Bearer ${SLACK_BOT_TOKEN}"
+              --data-urlencode "limit=200"
+            )
+
+            if [ -n "$cursor" ]; then
+              args+=(--data-urlencode "cursor=${cursor}")
+            fi
+
+            response=$(curl "${args[@]}")
+
+            if [ "$(echo "$response" | jq -r '.ok')" != "true" ]; then
+              echo "::error::Slack users.list failed"
+              echo "$response"
+              exit 1
+            fi
+
+            while IFS= read -r user_id; do
+              [ -n "$user_id" ] && USER_IDS+=("$user_id")
+            done < <(
+              echo "$response" |
+                jq -r '
+                  .members[]
+                  | select(.deleted == false)
+                  | select(.is_bot == false)
+                  | select(.is_app_user == false)
+                  | select(.is_restricted == false)
+                  | select(.is_ultra_restricted == false)
+                  | select(.name != "slackbot")
+                  | .id
+                '
+            )
+
+            cursor=$(echo "$response" |
+              jq -r '.response_metadata.next_cursor // empty')
+
+            [ -z "$cursor" ] && break
+          done
+
+          echo "Workspace members found: ${#USER_IDS[@]}"
+
+          #
+          # conversations.invite는 한 요청에 여러 사용자 초대 가능.
+          # 여유 있게 100명 단위로 나눠 처리.
+          #
+          BATCH_SIZE=100
+
+          for ((i=0; i<${#USER_IDS[@]}; i+=BATCH_SIZE)); do
+            batch=("${USER_IDS[@]:i:BATCH_SIZE}")
+
+            USERS=$(IFS=, ; echo "${batch[*]}")
+
+            payload=$(jq -n \
+              --arg channel "$CHANNEL_ID" \
+              --arg users "$USERS" \
+              '{
+                channel: $channel,
+                users: $users,
+                force: true
+              }')
+
+            response=$(curl \
+              --silent \
+              --show-error \
+              -X POST \
+              "https://slack.com/api/conversations.invite" \
+              -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+              -H "Content-Type: application/json; charset=utf-8" \
+              --data "$payload")
+
+            if [ "$(echo "$response" | jq -r '.ok')" != "true" ]; then
+              error=$(echo "$response" | jq -r '.error')
+
+              if [ "$error" != "already_in_channel" ]; then
+                echo "::warning::Slack conversations.invite returned: $error"
+                echo "$response"
+              fi
+            fi
+          done
+
+          echo "Workspace members invited to channel."
